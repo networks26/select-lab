@@ -8,6 +8,7 @@
 #include <sys/select.h>
 #include <netinet/in.h>
 #include <errno.h>
+#include <signal.h>
 
 #define PORT 12345
 #define MAX_CLIENTS  FD_SETSIZE  // or define your own limit
@@ -20,6 +21,31 @@
  *  - This allows multiple client connections to be handled in a single thread.
  */
 
+/*
+ * DRAGON #4: Ctrl+C (SIGINT) should shut down the server cleanly.
+ * Remember last week's lab: sig_atomic_t, signal(), close(), errno.
+ *
+ * A handler should only request shutdown and do async-signal-safe work.
+ * The actual cleanup of client sockets belongs after the main loop.
+ */
+static volatile sig_atomic_t stop_requested = 0;
+static volatile sig_atomic_t listening_fd = -1;
+
+static void on_sigint(int signum)
+{
+    int saved_errno = errno;
+    (void)signum;
+
+    /* DRAGON #4 TODO:
+     * 1. Set stop_requested.
+     * 2. Close the listening socket (if it is open), and mark it closed.
+     *    Why might closing it help if SIGINT arrives just BEFORE select()?
+     * 3. Do not use printf() here.
+     */
+
+    errno = saved_errno;
+}
+
 int main(void)
 {
     int listen_fd, new_fd, max_fd, i;
@@ -28,6 +54,10 @@ int main(void)
     char buffer[BUFFER_SIZE];
     int client_sockets[MAX_CLIENTS];
     fd_set read_fds;
+
+    /* DRAGON #4 TODO: Register on_sigint as the handler for SIGINT.
+     * Hint: look at signal(SIGINT, ...) in last week's server.c.
+     */
 
     // 1. Create the listening socket
     // DRAGON #1 - 111 on the next line won't work. What number to use for TCP?
@@ -41,7 +71,7 @@ int main(void)
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family      = AF_INET;
     server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    // DRAGON #2 - the following string won't work. It won't listen on the port you want. Fix it.
+    // DRAGON #2 - the following string won't work. It won't listen on the port you want.  Fix it.
     server_addr.sin_port        = PORT;
 
     if (bind(listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
@@ -62,9 +92,15 @@ int main(void)
         client_sockets[i] = -1;  // -1 indicates available slot
     }
 
+    /* DRAGON #4: Let the handler know which descriptor is listening.
+     * See how the previous lab dealt with its listening socket.
+     */
+    listening_fd = listen_fd;
+
     printf("Server listening on 127.0.0.1:%d\n", PORT);
 
     // 4. Server loop
+    // DRAGON #4 TODO: Stop this loop when SIGINT requests shutdown.
     while (1) {
         FD_ZERO(&read_fds);
         FD_SET(listen_fd, &read_fds);
@@ -82,11 +118,23 @@ int main(void)
         }
 
         // 5. Use select() to monitor sockets
-        int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL); \\ <-- This is select
-        if (activity < 0 && errno != EINTR) {
+        int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL); // This is select!
+        if (activity < 0) {
+            /* DRAGON #4 TODO:
+             * - A signal may interrupt select() (errno == EINTR).
+             * - Closing the listening socket may cause errno == EBADF.
+             * - If stop_requested, leave the loop without reporting an
+             *   expected shutdown as an error.
+             * - Otherwise retry on EINTR, or report real errors.
+             * Never use FD_ISSET() when select() has failed.
+             */
+            if (errno == EINTR) {
+                continue;
+            }
             perror("select");
             break;
         }
+        // DRAGON #4 TODO: Check stop_requested again before using read_fds.
 
         // 6. Check if we have a new connection on listening socket
         if (FD_ISSET(listen_fd, &read_fds)) {
@@ -151,14 +199,21 @@ int main(void)
         }
     }
 
-    // Cleanup
-    close(listen_fd);
+    // Cleanup (ordinary code, not inside the signal handler).
+    // DRAGON #4: The SIGINT handler may ALREADY have closed listen_fd.
+    if (listening_fd >= 0) {
+        listening_fd = -1;
+        close(listen_fd);
+    }
     for (i = 0; i < MAX_CLIENTS; i++) {
         if (client_sockets[i] != -1) {
             close(client_sockets[i]);
         }
     }
 
+    if (stop_requested) {
+        puts("Server: SIGINT caught; sockets closed, exiting");
+    }
     return 0;
 }
 
